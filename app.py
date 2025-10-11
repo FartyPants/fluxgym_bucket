@@ -455,6 +455,7 @@ def gen_sh(
     t5_path = resolve_path("models/clip/t5xxl_fp16.safetensors")
     ae_path = resolve_path("models/vae/ae.sft")
     sh = f"""accelerate launch {line_break}
+  --num_processes=1 {line_break}    
   --mixed_precision bf16 {line_break}
   --num_cpu_threads_per_process 1 {line_break}
   sd-scripts/flux_train_network.py {line_break}
@@ -1866,3 +1867,4 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
     demo.launch(debug=True, show_error=True, allowed_paths=[cwd])
+
