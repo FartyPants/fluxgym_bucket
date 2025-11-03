@@ -1,4 +1,6 @@
 import os
+# os.environ["USE_LIBUV"] = "0"
+
 import sys
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 os.environ['GRADIO_ANALYTICS_ENABLED'] = '0'
@@ -218,57 +220,106 @@ def load_captioning(uploaded_files, concept_sentence):
 def hide_captioning():
     return gr.update(visible=False), gr.update(visible=False)
 
-def resize_image(image_path, output_path, size):
+
+
+#Finds the Shorter Side: The if width < height: condition correctly identifies whether the image is portrait or lancape.
+#If it's a portrait (height is greater), it sets the shorter side (width) to the target size.
+#If it's a landscape or square (width is greater or equal), it sets the shorter side (height) to the target size.
+
+def resize_image(image_path, output_path, size, downscale_only):
     with Image.open(image_path) as img:
         width, height = img.size
-        if width < height:
-            new_width = size
-            new_height = int((size/width) * height)
+
+        # --- MODE 1: BUCKETING (Downscale Only) ---
+        if downscale_only:
+            # Only resize if the image's shortest side is LARGER than the target size.
+            if min(width, height) <= size:
+                print(f"Skipping resize for {os.path.basename(image_path)} ({width}x{height}) as it is not larger than target size {size}.")
+                # If the image isn't being resized, we still need to ensure it's at the output path.
+                if image_path != output_path:
+                    shutil.copy(image_path, output_path)
+                return
+            # If we proceed, it's a downscale operation.
+            print_prefix = f"Downscaling (for bucketing) {os.path.basename(image_path)}"
+        
+        # --- MODE 2: STANDARD (Resize All) ---
         else:
+            # For standard training, we resize everything, up or down.
+            print_prefix = f"Resizing {os.path.basename(image_path)}"
+
+
+        # Common resizing logic for both modes
+        if width < height:
+            # Portrait
+            new_width = size
+            new_height = int((size / width) * height)
+        else:
+            # Landscape or Square
             new_height = size
-            new_width = int((size/height) * width)
-        print(f"resize {image_path} : {new_width}x{new_height}")
+            new_width = int((size / height) * width)
+            
+        print(f"{print_prefix} from {width}x{height} to {new_width}x{new_height}")
         img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
         img_resized.save(output_path)
 
-def create_dataset(destination_folder, size, *inputs):
-    print("Creating dataset")
-    images = inputs[0]
+
+def create_dataset(destination_folder, size, downscale_only, *inputs):
+    print("--- Starting Dataset Creation ---")
+    all_files = inputs[0]
     if not os.path.exists(destination_folder):
         os.makedirs(destination_folder)
 
-    for index, image in enumerate(images):
-        # copy the images to the datasets folder
-        new_image_path = shutil.copy(image, destination_folder)
+    # 1. Split the input files into images and text files
+    image_files = [f for f in all_files if not f.lower().endswith('.txt')]
+    txt_files = [f for f in all_files if f.lower().endswith('.txt')]
 
-        # if it's a caption text file skip the next bit
-        ext = os.path.splitext(new_image_path)[-1].lower()
-        if ext == '.txt':
-            continue
+    # 2. Print the diagnostic info
+    print(f"Found {len(image_files)} image file(s).")
+    print(f"Found {len(txt_files)} provided caption file(s).")
 
-        # resize the images only if it is > 0
-        if size > 0:
-            resize_image(new_image_path, new_image_path, size)
+    # 3. Copy all provided .txt files first, so they will exist
+    print("\n--- Step 1: Copying all provided .txt caption files ---")
+    for txt_path in txt_files:
+        print(f"Copying provided caption: {os.path.basename(txt_path)}")
+        shutil.copy(txt_path, destination_folder)
 
-        # copy the captions
-
-        original_caption = inputs[index + 1]
-
+    # 4. Process the images
+    print("\n--- Step 2: Processing image files ---")
+    for index, image_path in enumerate(image_files):
+        # Copy the image to the destination folder
+        new_image_path = shutil.copy(image_path, destination_folder)
         image_file_name = os.path.basename(new_image_path)
+        print(f"Processing image: {image_file_name}")
+
+        # Resize the image if required
+        if size > 0:
+            resize_image(new_image_path, new_image_path, size, downscale_only)
+
+        # Determine the expected path for the caption file
         caption_file_name = os.path.splitext(image_file_name)[0] + ".txt"
         caption_path = resolve_path_without_quotes(os.path.join(destination_folder, caption_file_name))
-        print(f"image_path={new_image_path}, caption_path = {caption_path}, original_caption={original_caption}")
-        # if caption_path exists, do not write
+
+        # Check if a caption file already exists (from the previous step)
         if os.path.exists(caption_path):
-            print(f"{caption_path} already exists. use the existing .txt file")
-        else:
-            print(f"{caption_path} create a .txt caption file")
-            with open(caption_path, 'w') as file:
-                file.write(original_caption)
+            print(f"  > Caption file '{caption_file_name}' already exists. Using it.")
+            continue  # Move to the next image
 
-    print(f"destination_folder {destination_folder}")
+        # If it doesn't exist, create one from the UI textbox
+        print(f"  > Caption file not found. Creating '{caption_file_name}' from UI.")
+        try:
+            # Get the caption from the corresponding textbox on the UI
+            original_caption = inputs[index + 1]
+            with open(caption_path, 'w', encoding='utf-8') as file:
+                # Use (original_caption or "") to prevent errors if a caption box is empty/None
+                file.write(original_caption or "")
+        except IndexError:
+            # This is a safety net, but shouldn't happen with this new logic
+            print(f"  > !! ERROR: Could not find a caption for image index {index}. Creating empty caption file.")
+            with open(caption_path, 'w', encoding='utf-8') as file:
+                file.write("")
+
+    print("\n--- Dataset Creation Complete ---")
     return destination_folder
-
 
 def run_captioning(images, concept_sentence, *captions):
     print(f"run_captioning")
@@ -455,7 +506,7 @@ def gen_sh(
     t5_path = resolve_path("models/clip/t5xxl_fp16.safetensors")
     ae_path = resolve_path("models/vae/ae.sft")
     sh = f"""accelerate launch {line_break}
-  --num_processes=1 {line_break}    
+  --num_processes=1 {line_break}
   --mixed_precision bf16 {line_break}
   --num_cpu_threads_per_process 1 {line_break}
   sd-scripts/flux_train_network.py {line_break}
@@ -665,6 +716,7 @@ def update(
     resolutionX,
     resolutionY,
     resize,
+    downscale_only_value,
     seed,
     workers,
     class_tokens,
@@ -918,7 +970,7 @@ print(f"current_account={current_account}")
 
 # fpham added to support advanced options ****************************************
 # Note: These functions take values and return values, consistent with Gradio event handling
-def fill_bucket_parameters_logic(resolution_x_value, resolution_y_value, resize_value, *advanced_component_values): # Takes values
+def fill_bucket_parameters_logic(resolution_x_value, resolution_y_value, resize_value, downscale_only, *advanced_component_values): # Takes values
     """Calculates new values for bucket-related parameters and resize."""
     global advanced_component_ids # Use global list to map values/positions
     input_advanced_values_map = dict(zip(advanced_component_ids, advanced_component_values))
@@ -938,11 +990,12 @@ def fill_bucket_parameters_logic(resolution_x_value, resolution_y_value, resize_
             output_advanced_values.append(input_advanced_values_map.get(elem_id, None)) # Get from input values map
 
     new_resize_value = 0 # Set resize to 0 when enabling buckets
+    new_downscale_only = True
 
     # Return the calculated new values corresponding to the outputs list [*advanced_components, resize]
-    return (*output_advanced_values, new_resize_value)
+    return (*output_advanced_values, new_resize_value, new_downscale_only)
 
-def disable_buckets_logic(resolution_x_value, resize_value, *advanced_component_values): # Takes values
+def disable_buckets_logic(resolution_x_value, resize_value, downscale_only, *advanced_component_values): # Takes values
     """Calculates new values to disable buckets and sets resize to resolutionX."""
     global advanced_component_ids # Use global list to map values/positions
     input_advanced_values_map = dict(zip(advanced_component_ids, advanced_component_values))
@@ -959,17 +1012,17 @@ def disable_buckets_logic(resolution_x_value, resize_value, *advanced_component_
             output_advanced_values.append(input_advanced_values_map.get(elem_id, None)) # Get from input values map
 
     new_resize_value = resolution_x_value # Set resize to resolutionX value
-
+    new_downscale_only = False
     # Return the calculated new values corresponding to the outputs list [*advanced_components, resize]
     # To make the UI consistent, we should return the updated advanced values.
     # Assuming the intent was to update the checkboxes in the UI: outputs=[*advanced_components, resize]
     # If outputs is [resize], this function should only return new_resize_value.
     # Let's match the corrected outputs assumption (update checkboxes)
-    return (*output_advanced_values, new_resize_value)
+    return (*output_advanced_values, new_resize_value, new_downscale_only)
 
 
 def save_parameters_logic(
-    base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, seed_value,
+    base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
     workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value,
     save_every_n_epochs_value, timestep_sampling_value, guidance_scale_value, vram_value, num_repeats_value,
     sample_prompts_value, sample_every_n_steps_value,
@@ -987,6 +1040,7 @@ def save_parameters_logic(
         "resolutionX": resolutionX_value,
         "resolutionY": resolutionY_value,
         "resize": resize_value,
+        "downscale_only": downscale_only_value,
         "seed": seed_value,
         "workers": workers_value,
         "concept_sentence": concept_sentence_value,
@@ -1058,6 +1112,7 @@ def load_parameters_logic(save_filename_value): # Only need the value from the f
         resolutionX_val = params.get("resolutionX", None)
         resolutionY_val = params.get("resolutionY", None)
         resize_val = params.get("resize", None)
+        downscale_only_val = params.get("downscale_only", None)
         seed_val = params.get("seed", None)
         workers_val = params.get("workers", None)
         concept_sentence_val = params.get("concept_sentence", None)
@@ -1085,7 +1140,7 @@ def load_parameters_logic(save_filename_value): # Only need the value from the f
         # Return all basic values followed by all advanced values
         # The order must exactly match the outputs list defined in the .click() event
         return (
-            base_model_val, lora_name_val, resolutionX_val, resolutionY_val, resize_val,
+            base_model_val, lora_name_val, resolutionX_val, resolutionY_val, resize_val, downscale_only_val,
             seed_val, workers_val, concept_sentence_val, learning_rate_val, network_dim_val,
             max_train_epochs_val, save_every_n_epochs_val, timestep_sampling_val, guidance_scale_val,
             vram_val, num_repeats_val, sample_prompts_val, sample_every_n_steps_val,
@@ -1133,7 +1188,7 @@ def get_json_files():
 
 # --- New function to save as Kohya JSON ---
 def save_as_kohya_json_logic(
-    base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, seed_value,
+    base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
     workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value,
     save_every_n_epochs_value, timestep_sampling_value, guidance_scale_value, vram_value, num_repeats_value,
     sample_prompts_value, sample_every_n_steps_value,
@@ -1582,7 +1637,10 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     total_steps = gr.Number(0, interactive=False, label="Expected training steps")
                     sample_prompts = gr.Textbox("", lines=5, label="Sample Image Prompts (Separate with new lines)", interactive=True)
                     sample_every_n_steps = gr.Number(0, precision=0, label="Sample Image Every N Steps", interactive=True)
-                    resize = gr.Number(value=512, precision=0, label="FluxGym Resize Images (0 = don't resize [for buckets])", interactive=True)
+                    with gr.Row():
+                        resize = gr.Number(value=512, precision=0, label="Resize Shortest Edge To ... (0 - no resize - for Buckets)", interactive=True, scale=3)
+                        downscale_only = gr.Checkbox(value=False, label="Downscale Only (for Bucketing)", scale=1)
+
                     resolutionX = gr.Number(value=512, precision=0, label="Train Resolution width", interactive=True)
                     resolutionY = gr.Number(value=0, precision=0, label="Train Resolution height (0 = square)", interactive=True)
                     gr.Markdown("Note: For buckets, set Resize to 0, set --bucket_no_upscale, --enable_buckets, and set --max_bucket_reso to the Train resolution width or height whichever is larger.")
@@ -1704,6 +1762,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         resolutionX,
         resolutionY,
         resize,
+        downscale_only,
         seed,
         workers,
         concept_sentence,
@@ -1728,7 +1787,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         fn=load_parameters_logic,
         inputs=[save_filename], # Input is just the filename value
         outputs=[
-            base_model, lora_name, resolutionX, resolutionY, resize, seed, workers,
+            base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
             concept_sentence, learning_rate, network_dim, max_train_epochs,
             save_every_n_epochs, timestep_sampling, guidance_scale, vram,
             num_repeats, sample_prompts, sample_every_n_steps,
@@ -1746,8 +1805,8 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
 
     fill_advanced_button.click(
         fn=fill_bucket_parameters_logic,
-        inputs=[resolutionX,resolutionY, resize, *advanced_components], # Pass values
-        outputs=[*advanced_components, resize] # Update advanced components and resize
+        inputs=[resolutionX,resolutionY, resize, downscale_only, *advanced_components], # Pass values
+        outputs=[*advanced_components, resize, downscale_only] # Update advanced components and resize
     ).then( # Chain the update function to regenerate script/config
          fn=update,
          inputs=listeners, # Pass all listener component values
@@ -1760,8 +1819,8 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     # Let's match the assumed intent of updating the checkboxes based on original code modifying component objects.
     disable_buckets_button.click(
         fn=disable_buckets_logic,
-        inputs=[resolutionX, resize, *advanced_components], # Pass values
-        outputs=[*advanced_components, resize] # Update advanced components and resize
+        inputs=[resolutionX, resize, downscale_only,*advanced_components], # Pass values
+        outputs=[*advanced_components, resize, downscale_only] # Update advanced components and resize
     ).then( # Chain the update function
          fn=update,
          inputs=listeners, # Pass all listener component values
@@ -1782,7 +1841,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     save_button.click(
         fn=save_parameters_logic,
         inputs=[
-            base_model, lora_name, resolutionX, resolutionY, resize, seed, workers,
+            base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
             concept_sentence, learning_rate, network_dim, max_train_epochs,
             save_every_n_epochs, timestep_sampling, guidance_scale, vram,
             num_repeats, sample_prompts, sample_every_n_steps,
@@ -1796,7 +1855,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     save_kohya_button.click(
         fn=save_as_kohya_json_logic,
         inputs=[
-            base_model, lora_name, resolutionX, resolutionY, resize, seed, workers,
+            base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
             concept_sentence, learning_rate, network_dim, max_train_epochs,
             save_every_n_epochs, timestep_sampling, guidance_scale, vram,
             num_repeats, sample_prompts, sample_every_n_steps,
@@ -1850,7 +1909,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         outputs=[total_steps]
     )
     concept_sentence.change(fn=update_sample, inputs=[concept_sentence], outputs=sample_prompts)
-    start.click(fn=create_dataset, inputs=[dataset_folder, resize, images] + caption_list, outputs=dataset_folder).then(
+    start.click(fn=create_dataset, inputs=[dataset_folder, resize, downscale_only, images] + caption_list, outputs=dataset_folder).then(
         fn=start_training,
         inputs=[
             base_model,
@@ -1867,4 +1926,3 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
     demo.launch(debug=True, show_error=True, allowed_paths=[cwd])
-
