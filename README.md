@@ -98,6 +98,15 @@ So this will resize the shortest dimension of all images to 768 and the buckets 
 
 Now start. 
 
+# Avoid double resizing penalty
+
+If you use Resize non zero it will resize images before processing further. But if you have buckets enabled, the buckets will also resize these images once more, potentially making them blurry. In fact in the original Flux Gym you could have flux gym resize image up and then bucket resize it down making the result blurry. 
+
+So the solution is 
+
+a) don't resize anything (Resize = 0) The buckets will resize the images as needed, as set by the Width and Height resolution (whichever is bigger).
+b) if you must resize images, then choose the Width and the Height to be one that of most images after resize. So if you have most images 896 x 1152 and you set Resize to 768 then you need to set your resolution width to 768 and height to 986 (so scalled down 896 x 1152). This will create bucket with most images used directly without further second resizing in the training process.
+
 # Example 1 for bucket with mostly square images or equal mix of square and non square images
 You should manually create the desired multi-resolution images. Don't just gobble random images in various random sizes - this will NOT work as you imagine. So say stick to 768 x 768, 768 x 1024, 1024 x 768 for 3 buckets. If you put random images that are seriously different than the resolution the result will be glorified garbage as the resizing will make it blurry (LORA seems to picks up on that part most).
 You probably want to always use --bucket_no_upscale because upsaclaing buckets makes things worse every time. 
