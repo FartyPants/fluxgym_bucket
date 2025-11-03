@@ -74,6 +74,29 @@ Press: Quick Enable Buckets
 
 (it will use the whichever is larger (width or height) to set max bucket size, it will zero resize, set enable bucket and no upsacale)
 
+# Quick Bucket plus Resize down (faster Lora creation)
+
+**(I have images of various sizes, but want to make Lora faster)**
+
+say you have images of 860 x 1200, 1200 x 860, 768 x 768 etc...
+
+If you want the best quality you would set width/height to 860 x 1200. But it will take forever. If you want faster Lora creation, you can do it by making training 768 x 768 
+
+resolution width: 768
+resolution height: 768 
+
+Press: Quick Enable Buckets
+
+(it will use the resolution width to set max bucket size, it will zero resize, set enable bucket and no upsacale and check Resize down only checkbox)
+
+After you press the Quick Enable buckets, see the Resize is set to 0, but in this case we want to resize down the input images 
+
+Set Resize to the same size as resolution width: 768
+Set Downsize only checkbox (if you have any images that are < 768, it will not size them up, but create a bucket for them)
+
+So this will resize the shortest dimension of all images to 768 and the buckets will be created accordingly with smaller sizes
+
+Now start. 
 
 # Example 1 for bucket with mostly square images or equal mix of square and non square images
 You should manually create the desired multi-resolution images. Don't just gobble random images in various random sizes - this will NOT work as you imagine. So say stick to 768 x 768, 768 x 1024, 1024 x 768 for 3 buckets. If you put random images that are seriously different than the resolution the result will be glorified garbage as the resizing will make it blurry (LORA seems to picks up on that part most).
