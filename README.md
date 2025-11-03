@@ -29,6 +29,7 @@ NEW: Fixed serious issue in original FlugGym where some images might be skipped 
 # Other changes from original pull requests
 - proper calculation of step count (in original it would count also non image files, giving you wildly exgerrated step-count)
 - UTF-8 for caption
+- proper image/txt collection - the original method can very easily skip images because of how messy it was designed. (So you think you are training on 100 images, but it only collected 70 for example)
 
 My changes were done so it can correctly work with buckets. The original code not only merged resolution and resize into one parameter but it will always resize all images, making -enable_bucket counter-intuitive or kinda worthless because it will lead in double resizing (potentially in both direction)
 
