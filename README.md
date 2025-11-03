@@ -6,9 +6,12 @@ Enhanced Dead simple web UI for training FLUX LoRA **with LOW VRAM (12GB/16GB/20
 
 # Here are my additions: 
 
+NEW: Fixed serious issue in original FlugGym where some images might be skipped due to poor logic in image processing . (Like you add 100 images, but it uses only 70) This new method is robust and clean .
+
 - LORA resolution and resize is separated
 - resolution is a tuple (width and Height)
 - resize = 0 will not resize the images
+- downsize only checkbox for resize 
   
 ![image](https://github.com/user-attachments/assets/5a7bbd4d-568f-49b8-9255-115470ad523e)
 
