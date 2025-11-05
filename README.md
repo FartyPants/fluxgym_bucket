@@ -8,6 +8,9 @@ Enhanced Dead simple web UI for training FLUX LoRA **with LOW VRAM (12GB/16GB/20
 
 NEW: Fixed serious issue in original FlugGym where some images might be skipped due to poor logic in image processing . (Like you add 100 images, but it uses only 70) This new method is robust and clean .
 
+- The app now spawns a new terminal for the Kohya process instead of redirecting the Kohya messages to the gradio
+  This is more reliable, logical and you also can clearly see if the other process is running or not (for example if you previously by accident closed the FluxGym browser window, you gad no idea if the process continues or not
+- added Batch parameter, clearly defined
 - LORA resolution and resize is separated
 - resolution is a tuple (width and Height)
 - resize = 0 will not resize the images
