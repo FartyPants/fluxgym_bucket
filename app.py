@@ -1,6 +1,7 @@
 import os
 # os.environ["USE_LIBUV"] = "0"
-
+import atexit
+import signal
 import sys
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 os.environ['GRADIO_ANALYTICS_ENABLED'] = '0'
@@ -23,12 +24,33 @@ from argparse import Namespace
 import train_network
 import toml
 import re
-import json
+import math
+
+
+training_subprocess = None
 
 MAX_IMAGES = 150
 
 with open('models.yaml', 'r') as file:
     models = yaml.safe_load(file)
+
+def cleanup_child_process():
+    """Function to be called on script exit to terminate any running subprocess."""
+    global training_subprocess
+    if training_subprocess and training_subprocess.poll() is None:
+        print("--- Main application is exiting. Terminating training subprocess... ---")
+        # On Windows, taskkill is more reliable for killing process trees
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(training_subprocess.pid)])
+        else: # On Linux/macOS, os.killpg is better for process groups
+            os.killpg(os.getpgid(training_subprocess.pid), signal.SIGTERM)
+        training_subprocess.terminate()
+        training_subprocess.wait()
+        print("--- Training subprocess terminated. ---")
+
+# Register the cleanup function to be called on exit
+atexit.register(cleanup_child_process)
+
 
 def readme(base_model, lora_name, instance_prompt, sample_prompts):
 
@@ -263,63 +285,50 @@ def resize_image(image_path, output_path, size, downscale_only):
         img_resized.save(output_path)
 
 
+    
 def create_dataset(destination_folder, size, downscale_only, *inputs):
-    print("--- Starting Dataset Creation ---")
+    print("INFO: Starting dataset creation...")
     all_files = inputs[0]
     if not os.path.exists(destination_folder):
         os.makedirs(destination_folder)
 
-    # 1. Split the input files into images and text files
+    # Clean the destination folder
+    for old_file in os.listdir(destination_folder):
+        if old_file.lower().endswith('.txt'):
+            os.remove(os.path.join(destination_folder, old_file))
+
     image_files = [f for f in all_files if not f.lower().endswith('.txt')]
-    txt_files = [f for f in all_files if f.lower().endswith('.txt')]
+    provided_txt_files = [f for f in all_files if f.lower().endswith('.txt')]
+    print(f"INFO: Found {len(image_files)} image(s) and {len(provided_txt_files)} provided caption file(s).")
 
-    # 2. Print the diagnostic info
-    print(f"Found {len(image_files)} image file(s).")
-    print(f"Found {len(txt_files)} provided caption file(s).")
-
-    # 3. Copy all provided .txt files first, so they will exist
-    print("\n--- Step 1: Copying all provided .txt caption files ---")
-    for txt_path in txt_files:
-        print(f"Copying provided caption: {os.path.basename(txt_path)}")
+    # Process files...
+    provided_txt_basenames = set()
+    for txt_path in provided_txt_files:
+        basename = os.path.splitext(os.path.basename(txt_path))[0]
+        provided_txt_basenames.add(basename)
         shutil.copy(txt_path, destination_folder)
 
-    # 4. Process the images
-    print("\n--- Step 2: Processing image files ---")
     for index, image_path in enumerate(image_files):
-        # Copy the image to the destination folder
         new_image_path = shutil.copy(image_path, destination_folder)
-        image_file_name = os.path.basename(new_image_path)
-        print(f"Processing image: {image_file_name}")
-
-        # Resize the image if required
         if size > 0:
             resize_image(new_image_path, new_image_path, size, downscale_only)
-
-        # Determine the expected path for the caption file
-        caption_file_name = os.path.splitext(image_file_name)[0] + ".txt"
-        caption_path = resolve_path_without_quotes(os.path.join(destination_folder, caption_file_name))
-
-        # Check if a caption file already exists (from the previous step)
-        if os.path.exists(caption_path):
-            print(f"  > Caption file '{caption_file_name}' already exists. Using it.")
-            continue  # Move to the next image
-
-        # If it doesn't exist, create one from the UI textbox
-        print(f"  > Caption file not found. Creating '{caption_file_name}' from UI.")
+        image_basename = os.path.splitext(os.path.basename(new_image_path))[0]
+        if image_basename in provided_txt_basenames:
+            continue
+        caption_path = resolve_path_without_quotes(os.path.join(destination_folder, image_basename + ".txt"))
         try:
-            # Get the caption from the corresponding textbox on the UI
-            original_caption = inputs[index + 1]
-            with open(caption_path, 'w', encoding='utf-8') as file:
-                # Use (original_caption or "") to prevent errors if a caption box is empty/None
-                file.write(original_caption or "")
+            ui_caption = inputs[index + 1]
+            if ui_caption and ui_caption.strip():
+                with open(caption_path, 'w', encoding='utf-8') as file:
+                    file.write(ui_caption.strip())
         except IndexError:
-            # This is a safety net, but shouldn't happen with this new logic
-            print(f"  > !! ERROR: Could not find a caption for image index {index}. Creating empty caption file.")
-            with open(caption_path, 'w', encoding='utf-8') as file:
-                file.write("")
+            pass
 
-    print("\n--- Dataset Creation Complete ---")
+    print(f"INFO: Dataset creation complete. Processed {len(image_files)} images into '{destination_folder}'.")
+    
+    # Return the final folder path to update the State variable
     return destination_folder
+  
 
 def run_captioning(images, concept_sentence, *captions):
     print(f"run_captioning")
@@ -572,7 +581,8 @@ def gen_toml(
   resolutionX,
   resolutionY,
   class_tokens,
-  num_repeats
+  num_repeats,
+  batch_size
 ):
     if resolutionY == 0:
         resolutionY = resolutionX
@@ -589,7 +599,7 @@ keep_tokens = 1
 
 [[datasets]]
 resolution = {resolution}
-batch_size = 1
+batch_size = {batch_size}
 keep_tokens = 1
 
   [[datasets.subsets]]
@@ -598,21 +608,35 @@ keep_tokens = 1
   num_repeats = {num_repeats}"""
     return toml
 
-def update_total_steps(max_train_epochs, num_repeats, images):
+def update_total_steps(max_train_epochs, num_repeats, images, batch_size):
     try:
-        # only count real image files
+        # Default info text
+        info_text = "Calculation: epochs * ceil(images / batch_size) * repeats"
+
+        if not all([max_train_epochs, num_repeats, images, batch_size]) or batch_size < 1:
+             return gr.update(value=0, info=info_text)
+
         img_exts = {'.jpg','.jpeg','.png','.bmp','.gif','.webp'}
         num_images = sum(
             1 for path in images
             if os.path.splitext(path)[1].lower() in img_exts
         )
-        # num_images = len(images)
-        total_steps = max_train_epochs * num_images * num_repeats
-        print(f"max_train_epochs={max_train_epochs} num_images={num_images}, num_repeats={num_repeats}, total_steps={total_steps}")
-        return gr.update(value = total_steps)
-    except:
-        print("")
 
+        if num_images == 0:
+            return gr.update(value=0, info=info_text)
+
+        # Use math.ceil for a correct and reliable calculation.
+        steps_per_epoch = math.ceil(num_images / batch_size)
+        total_steps = max_train_epochs * steps_per_epoch * num_repeats
+
+        info_text = f"{max_train_epochs} epochs * ceil({num_images} images / {batch_size} batch_size) * {num_repeats} repeats"
+        
+        print(f"max_train_epochs={max_train_epochs} num_images={num_images}, num_repeats={num_repeats}, batch_size={batch_size}, total_steps={total_steps}")
+        return gr.update(value=int(total_steps), info=info_text)
+    except Exception as e:
+        print(f"Error in update_total_steps: {e}")
+        return gr.update(value=0, info="Calculation: epochs * ceil(images / batch_size) * repeats")
+    
 def set_repo(lora_rows):
     selected_name = os.path.basename(lora_rows)
     return gr.update(value=selected_name)
@@ -636,8 +660,13 @@ def get_samples(lora_name):
         return files
     except:
         return []
+    
+    
+      
+import subprocess # Make sure this is imported at the top of the file if not already
 
-def start_training(
+# original logview
+def start_training_logview(
     base_model,
     lora_name,
     train_script,
@@ -710,6 +739,139 @@ def start_training(
     gr.Info(f"Training Complete. Check the outputs folder for the LoRA files.", duration=None)
 
 
+def start_training(
+    base_model,
+    lora_name,
+    train_script,
+    train_config,
+    sample_prompts,
+):
+
+    # write custom script and toml
+    if not os.path.exists("models"):
+        os.makedirs("models", exist_ok=True)
+    if not os.path.exists("outputs"):
+        os.makedirs("outputs", exist_ok=True)
+
+
+    output_name = slugify(lora_name)
+    output_dir = resolve_path_without_quotes(f"outputs/{output_name}")
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+
+    print("INFO: Preparing training files...")
+    download(base_model)
+    print("INFO: Base model check complete.")
+    
+
+    # --- SCRIPT AND CONFIG FILE GENERATION ---
+    file_type = "sh"
+    if sys.platform == "win32": file_type = "bat"
+
+    sh_filename = f"train.{file_type}"
+    
+    sh_filepath = resolve_path_without_quotes(f"outputs/{output_name}/{sh_filename}") # Now this will work
+    with open(sh_filepath, 'w', encoding="utf-8") as file: file.write(train_script)
+    print(f"INFO: Generated train script at {sh_filename}")
+
+    dataset_path = resolve_path_without_quotes(f"outputs/{output_name}/dataset.toml")
+    with open(dataset_path, 'w', encoding="utf-8") as file: file.write(train_config)
+    print("INFO: Generated dataset.toml")
+
+    sample_prompts_path = resolve_path_without_quotes(f"outputs/{output_name}/sample_prompts.txt")
+    with open(sample_prompts_path, 'w', encoding='utf-8') as file: file.write(sample_prompts)
+    print("INFO: Generated sample_prompts.txt")
+
+
+        # --- METADATA GENERATION (MOVED TO BEFORE TRAINING) ---
+    print("INFO: Generating README.md model card...")
+    try:
+        config = toml.loads(train_config)
+        # Note: We need to read the sample prompts from the text, not the potentially empty file
+        prompt_lines = [line.strip() for line in sample_prompts.split('\n') if len(line.strip()) > 0 and line[0] != "#"]
+        concept_sentence = config['datasets'][0]['subsets'][0]['class_tokens']
+        md = readme(base_model, lora_name, concept_sentence, prompt_lines)
+        readme_path = resolve_path_without_quotes(f"outputs/{output_name}/README.md")
+        with open(readme_path, "w", encoding="utf-8") as f: f.write(md)
+        print("INFO: README.md generated.")
+    except Exception as e:
+        print(f"WARNING: Could not generate README.md: {e}")
+
+    print("INFO: Copying training config to output directory...")
+    try:
+        src_config_path = resolve_path_without_quotes("configs/last_run.json")
+        dest_config_path = os.path.join(output_dir, "training_config.json")
+        shutil.copy2(src_config_path, dest_config_path)
+        print(f"INFO: Saved config to {dest_config_path}")
+    except Exception as e:
+        print(f"WARNING: Could not copy config file to output directory: {e}")
+
+
+    # --- LAUNCH THE SUBPROCESS ---
+    gr.Info("Started training. A new terminal window should appear...")
+    print("\n" + "="*80)
+    print("INFO: Starting training process.")
+    print(f"--- LAUNCHING TRAINING SCRIPT IN NEW WINDOW: {sh_filepath} ---")
+    print("INFO: PLEASE MONITOR THE OTHER TERMINAL WINDOW FOR LIVE TRAINING PROGRESS.")
+    print("INFO: (Even if you close this window, the training process will continue!)")
+    print("="*80 + "\n")
+
+    global training_subprocess
+    try:
+        command_to_run = []
+        popen_kwargs = {}
+        
+        if sys.platform == "win32":
+            # We explicitly call cmd.exe.
+            # /C will run the command and then terminate the window.
+            # /K will run the command and keep the window open (useful for debugging). Let's use /C for normal operation.
+            command_to_run = ['cmd', '/C', sh_filepath]
+            
+            # This flag now correctly applies to the cmd.exe process, creating a visible window for it.
+            popen_kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
+            # We don't need shell=True when explicitly calling 'cmd'.
+        else: # For Linux/macOS
+            command_to_run = ["bash", sh_filepath]
+            popen_kwargs['preexec_fn'] = os.setsid
+
+        # Use Popen to have control over the subprocess
+        training_subprocess = subprocess.Popen(
+            command_to_run,
+            **popen_kwargs
+        )
+
+        training_subprocess.wait()
+
+        if training_subprocess.returncode != 0:
+            raise subprocess.CalledProcessError(training_subprocess.returncode, command_to_run)
+
+        # --- This part runs AFTER training is successful ---
+        training_subprocess = None
+        
+        print("\n" + "="*80)
+        print("INFO: Training process finished.")
+        print("INFO: All tasks complete.")
+        gr.Info(f"Training Complete! Check the outputs folder for the LoRA files.", duration=None)
+
+    except subprocess.CalledProcessError as e:
+        error_message = f"ERROR: Training script failed with exit code {e.returncode}. Please check the system terminal for detailed error messages."
+        print("\n" + "="*50)
+        print(error_message)
+        print("="*50)
+        print(f"\n--- TRAINING FAILED with exit code {e.returncode} ---")
+        gr.Error("Training failed! Check the new terminal window for error messages.")
+    except Exception as e:
+        error_message = f"ERROR: An unexpected error occurred: {e}"
+        print("\n" + "="*50)
+        print(error_message)
+        print("="*50)
+        print(f"\n--- AN UNEXPECTED ERROR OCCURRED: {e} ---")
+        gr.Error(f"An unexpected error occurred: {e}")
+    finally:
+        training_subprocess = None
+
+
 def update(
     base_model,
     lora_name,
@@ -723,6 +885,7 @@ def update(
     learning_rate,
     network_dim,
     max_train_epochs,
+    batch_size,
     save_every_n_epochs,
     timestep_sampling,
     guidance_scale,
@@ -757,7 +920,8 @@ def update(
         resolutionX,
         resolutionY,
         class_tokens,
-        num_repeats
+        num_repeats,
+        batch_size
     )
     return gr.update(value=sh), gr.update(value=toml), dataset_folder
 
@@ -917,6 +1081,32 @@ label { font-weight: bold !important; }
 
 js = """
 function() {
+    // Autoscroll logic has been removed. We write to terminal
+
+    function debounce(fn, delay) {
+        let timeoutId;
+        return function(...args) {
+            clearTimeout(timeoutId);
+            timeoutId = setTimeout(() => fn(...args), delay);
+        };
+    }
+
+    function handleClick() {
+        console.log("refresh")
+        document.querySelector("#refresh").click();
+    }
+    const debouncedClick = debounce(handleClick, 1000);
+    document.addEventListener("input", debouncedClick);
+
+    document.querySelector("#start_training").addEventListener("click", (e) => {
+      e.target.classList.add("clicked")
+      e.target.innerHTML = "Training..."
+    })
+}
+"""
+
+old_js = """
+function() {
     let autoscroll = document.querySelector("#autoscroll")
     if (window.iidxx) {
         window.clearInterval(window.iidxx);
@@ -1020,10 +1210,31 @@ def disable_buckets_logic(resolution_x_value, resize_value, downscale_only, *adv
     # Let's match the corrected outputs assumption (update checkboxes)
     return (*output_advanced_values, new_resize_value, new_downscale_only)
 
+def save_last_run_config(
+    base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
+    workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value,
+    batch_size_value, save_every_n_epochs_value, timestep_sampling_value, guidance_scale_value, vram_value, num_repeats_value,
+    sample_prompts_value, sample_every_n_steps_value,
+    *advanced_component_values
+):
+    """A wrapper to call save_parameters_logic with a fixed filename."""
+    print("--- Saving configuration to last_run.json ---")
+    
+    # We now explicitly pass all arguments in the correct order to the underlying logic function.
+    # The filename is hardcoded as "last_run.json".
+    save_parameters_logic(
+        base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
+        workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value,
+        batch_size_value, save_every_n_epochs_value, timestep_sampling_value, guidance_scale_value, vram_value, num_repeats_value,
+        sample_prompts_value, sample_every_n_steps_value,
+        "last_run.json", # <-- The filename is now in the correct position
+        *advanced_component_values
+    )
+
 
 def save_parameters_logic(
     base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
-    workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value,
+    workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value, batch_size_value,
     save_every_n_epochs_value, timestep_sampling_value, guidance_scale_value, vram_value, num_repeats_value,
     sample_prompts_value, sample_every_n_steps_value,
     filename_value, # Filename component value
@@ -1047,6 +1258,7 @@ def save_parameters_logic(
         "learning_rate": learning_rate_value,
         "network_dim": network_dim_value,
         "max_train_epochs": max_train_epochs_value,
+        "batch_size": batch_size_value,
         "save_every_n_epochs": save_every_n_epochs_value,
         "timestep_sampling": timestep_sampling_value,
         "guidance_scale": guidance_scale_value,
@@ -1060,12 +1272,11 @@ def save_parameters_logic(
     advanced_params = dict(zip(advanced_component_ids, advanced_component_values))
     params["advanced_parameters"] = advanced_params
 
-    # Construct the full save path
     if not filename_value or not filename_value.strip():
-        gr.Warning("Please provide a filename to save.")
-        return # Nothing to return as outputs=None
+        return gr.update()
 
     save_filename = filename_value.strip()
+
     if not save_filename.lower().endswith(".json"):
         save_filename += ".json"
     save_path = os.path.join("configs", save_filename)
@@ -1119,6 +1330,7 @@ def load_parameters_logic(save_filename_value): # Only need the value from the f
         learning_rate_val = params.get("learning_rate", None)
         network_dim_val = params.get("network_dim", None)
         max_train_epochs_val = params.get("max_train_epochs", None)
+        batch_size_val = params.get("batch_size", 1)
         save_every_n_epochs_val = params.get("save_every_n_epochs", None)
         timestep_sampling_val = params.get("timestep_sampling", None)
         guidance_scale_val = params.get("guidance_scale", None)
@@ -1142,7 +1354,7 @@ def load_parameters_logic(save_filename_value): # Only need the value from the f
         return (
             base_model_val, lora_name_val, resolutionX_val, resolutionY_val, resize_val, downscale_only_val,
             seed_val, workers_val, concept_sentence_val, learning_rate_val, network_dim_val,
-            max_train_epochs_val, save_every_n_epochs_val, timestep_sampling_val, guidance_scale_val,
+            max_train_epochs_val, batch_size_val, save_every_n_epochs_val, timestep_sampling_val, guidance_scale_val,
             vram_val, num_repeats_val, sample_prompts_val, sample_every_n_steps_val,
             *output_advanced_values # Unpack the collected advanced values into the return tuple
         )
@@ -1591,7 +1803,6 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                 gr.HTML("""<nav>
             <img id='logo' src='/file=icon.png' width='80' height='80'>
             <div class='flexible'></div>
-            <button id='autoscroll' class='on hidden'></button>
         </nav>
         """)
             with gr.Row():
@@ -1623,7 +1834,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     )
                     concept_sentence = gr.Textbox(
                         elem_id="--concept_sentence",
-                        label="Trigger word/sentence",
+                        label="Trigger word/sentence (class_tokens)",
                         info="Trigger word or sentence to be used",
                         placeholder="uncommon word like p3rs0n or trtcrd, or sentence like 'in the style of CNSTLL'",
                         interactive=True,
@@ -1634,7 +1845,8 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     vram = gr.Radio(["20G", "16G", "12G" ], value="20G", label="VRAM", interactive=True)
                     num_repeats = gr.Number(value=10, precision=0, label="Repeat trains per image", interactive=True)
                     max_train_epochs = gr.Number(label="Max Train Epochs", value=16, interactive=True)
-                    total_steps = gr.Number(0, interactive=False, label="Expected training steps")
+                    batch_size = gr.Number(label="Batch Size", value=1, precision=0, minimum=1, interactive=True)
+                    total_steps = gr.Number(0, interactive=False, label="Expected training steps", info="Calculation: epochs * ceil(images / batch_size) * repeats")
                     sample_prompts = gr.Textbox("", lines=5, label="Sample Image Prompts (Separate with new lines)", interactive=True)
                     sample_every_n_steps = gr.Number(0, precision=0, label="Sample Image Every N Steps", interactive=True)
                     with gr.Row():
@@ -1715,8 +1927,14 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     with gr.Column(min_width=300):
                         network_dim = gr.Number(label="--network_dim", info="LoRA Rank", value=4, minimum=4, maximum=128, step=4, interactive=True)
                     advanced_components, advanced_component_ids = init_advanced()
+                    try:
+                        train_batch_size_index = advanced_component_ids.index('--train_batch_size')
+                        train_batch_size_component = advanced_components[train_batch_size_index]
+                    except ValueError:
+                        print("Warning: --train_batch_size component not found in advanced options.")
+                        train_batch_size_component = None
             with gr.Row():
-                terminal = LogsView(label="Train log", elem_id="terminal")
+                gr.Markdown("Note: The Process now creates it's own Terminal window")
             with gr.Row():
                 gallery = gr.Gallery(get_samples, inputs=[lora_name], label="Samples", every=10, columns=6)
 
@@ -1755,7 +1973,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     lora_rows.select(fn=set_repo, inputs=[lora_rows], outputs=[repo_name])
     
     dataset_folder = gr.State()
-
+                     
     listeners = [
         base_model,
         lora_name,
@@ -1769,6 +1987,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         learning_rate,
         network_dim,
         max_train_epochs,
+        batch_size,
         save_every_n_epochs,
         timestep_sampling,
         guidance_scale,
@@ -1788,7 +2007,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         inputs=[save_filename], # Input is just the filename value
         outputs=[
             base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
-            concept_sentence, learning_rate, network_dim, max_train_epochs,
+            concept_sentence, learning_rate, network_dim, max_train_epochs, batch_size, 
             save_every_n_epochs, timestep_sampling, guidance_scale, vram,
             num_repeats, sample_prompts, sample_every_n_steps,
             *advanced_components # Unpack the list of advanced components
@@ -1842,7 +2061,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         fn=save_parameters_logic,
         inputs=[
             base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
-            concept_sentence, learning_rate, network_dim, max_train_epochs,
+            concept_sentence, learning_rate, network_dim, max_train_epochs, batch_size, 
             save_every_n_epochs, timestep_sampling, guidance_scale, vram,
             num_repeats, sample_prompts, sample_every_n_steps,
             save_filename, # Pass the filename component value
@@ -1883,43 +2102,87 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         hide_captioning,
         outputs=[captioning_area, start]
     )
+    
+    # Helper function to update advanced textbox from the main batch_size number input
+    def link_to_advanced_batch_size(value):
+        if train_batch_size_component:
+            return gr.update(value=str(value))
+        return gr.update() # No change if component not found
+
+    # Link the new batch_size component to the advanced option
+    batch_size.change(
+        fn=link_to_advanced_batch_size,
+        inputs=[batch_size],
+        outputs=[train_batch_size_component] if train_batch_size_component else None
+    )
+
+    # Update event listeners for total_steps calculation
+    total_steps_inputs = [max_train_epochs, num_repeats, images, batch_size]
+
     max_train_epochs.change(
         fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
+        inputs=total_steps_inputs,
         outputs=[total_steps]
     )
     num_repeats.change(
         fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
+        inputs= total_steps_inputs,
         outputs=[total_steps]
     )
+    batch_size.change(
+        fn=update_total_steps,
+        inputs= total_steps_inputs,
+        outputs=[total_steps]
+    )
+
     images.upload(
         fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
+        inputs= total_steps_inputs,
         outputs=[total_steps]
     )
     images.delete(
         fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
+        inputs= total_steps_inputs,
         outputs=[total_steps]
     )
     images.clear(
         fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
+        inputs= total_steps_inputs,
         outputs=[total_steps]
     )
     concept_sentence.change(fn=update_sample, inputs=[concept_sentence], outputs=sample_prompts)
-    start.click(fn=create_dataset, inputs=[dataset_folder, resize, downscale_only, images] + caption_list, outputs=dataset_folder).then(
-        fn=start_training,
-        inputs=[
-            base_model,
-            lora_name,
-            train_script,
-            train_config,
-            sample_prompts,
-        ],
-        outputs=terminal,
-    )
+
+    # Define a list of all parameter components that need to be saved.
+    # This must match the order expected by save_parameters_logic.
+    all_param_components = [
+        base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
+        concept_sentence, learning_rate, network_dim, max_train_epochs, batch_size,
+        save_every_n_epochs, timestep_sampling, guidance_scale, vram,
+        num_repeats, sample_prompts, sample_every_n_steps,
+        *advanced_components
+    ]
+
+    start.click(
+            fn=save_last_run_config,
+            inputs=all_param_components,
+            outputs=None
+        ).then(
+            fn=create_dataset,
+            inputs=[dataset_folder, resize, downscale_only, images] + caption_list,
+            outputs=[dataset_folder] # The only output is the updated folder path
+        ).then(
+            fn=start_training,
+            inputs=[
+                base_model,
+                lora_name,
+                train_script,
+                train_config,
+                sample_prompts,
+            ],
+            outputs=None, # This function has no UI outputs
+        )
+
+
     do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
     demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner])
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
