@@ -753,6 +753,8 @@ def start_training(
     if not os.path.exists("outputs"):
         os.makedirs("outputs", exist_ok=True)
 
+    print(f" Lora Name: {lora_name}")
+    print(f" train_script: {train_script}")
 
     output_name = slugify(lora_name)
     output_dir = resolve_path_without_quotes(f"outputs/{output_name}")
@@ -853,6 +855,7 @@ def start_training(
         print("INFO: Training process finished.")
         print("INFO: All tasks complete.")
         gr.Info(f"Training Complete! Check the outputs folder for the LoRA files.", duration=None)
+        return gr.update(value="Start training", interactive=True)
 
     except subprocess.CalledProcessError as e:
         error_message = f"ERROR: Training script failed with exit code {e.returncode}. Please check the system terminal for detailed error messages."
@@ -861,6 +864,7 @@ def start_training(
         print("="*50)
         print(f"\n--- TRAINING FAILED with exit code {e.returncode} ---")
         gr.Error("Training failed! Check the new terminal window for error messages.")
+        return gr.update(value="Start training", interactive=True)
     except Exception as e:
         error_message = f"ERROR: An unexpected error occurred: {e}"
         print("\n" + "="*50)
@@ -868,6 +872,7 @@ def start_training(
         print("="*50)
         print(f"\n--- AN UNEXPECTED ERROR OCCURRED: {e} ---")
         gr.Error(f"An unexpected error occurred: {e}")
+        return gr.update(value="Start training", interactive=True)
     finally:
         training_subprocess = None
 
@@ -930,12 +935,38 @@ demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, hf_account])
 """
 def loaded():
     global current_account
+    # --- Hugging Face Login Logic ---
     current_account = account_hf()
-    print(f"current_account={current_account}")
-    if current_account != None:
-        return gr.update(value=current_account["token"]), gr.update(visible=False), gr.update(visible=True), gr.update(value=current_account["account"], visible=True)
+    if current_account is not None:
+        hf_token_val = current_account["token"]
+        hf_login_visible = False
+        hf_logout_visible = True
+        repo_owner_val = current_account["account"]
+        repo_owner_visible = True
     else:
-        return gr.update(value=""), gr.update(visible=True), gr.update(visible=False), gr.update(value="", visible=False)
+        hf_token_val = ""
+        hf_login_visible = True
+        hf_logout_visible = False
+        repo_owner_val = ""
+        repo_owner_visible = False
+
+    # --- Config Dropdown Logic ---
+    json_files = get_json_files()
+    config_dropdown_val = None
+    if "last_run.json" in json_files:
+        config_dropdown_val = "last_run.json"
+    elif json_files: # If last_run doesn't exist, fall back to the first file
+        config_dropdown_val = json_files[0]
+
+    # --- Return all updates together ---
+    return (
+        gr.update(value=hf_token_val),
+        gr.update(visible=hf_login_visible),
+        gr.update(visible=hf_logout_visible),
+        gr.update(value=repo_owner_val, visible=repo_owner_visible),
+        gr.update(value=config_dropdown_val), # <-- New update for the dropdown
+    )
+
 
 def update_sample(concept_sentence):
     return gr.update(value=concept_sentence)
@@ -1076,7 +1107,6 @@ nav img.rotate { animation: rotate 2s linear infinite; }
 .hidden { display: none !important; }
 .codemirror-wrapper .cm-line { font-size: 12px !important; }
 label { font-weight: bold !important; }
-#start_training.clicked { background: silver; color: black; }
 """
 
 js = """
@@ -1097,10 +1127,6 @@ function() {
     }
     const debouncedClick = debounce(handleClick, 1000);
     document.addEventListener("input", debouncedClick);
-
-    document.querySelector("#start_training").addEventListener("click", (e) => {
-      e.target.classList.add("clicked")
-      e.target.innerHTML = "Training..."
     })
 }
 """
@@ -1231,6 +1257,7 @@ def save_last_run_config(
         *advanced_component_values
     )
 
+    return gr.update(value="Training...", interactive=False)
 
 def save_parameters_logic(
     base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
@@ -2165,7 +2192,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     start.click(
             fn=save_last_run_config,
             inputs=all_param_components,
-            outputs=None
+            outputs=start
         ).then(
             fn=create_dataset,
             inputs=[dataset_folder, resize, downscale_only, images] + caption_list,
@@ -2179,12 +2206,12 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                 train_config,
                 sample_prompts,
             ],
-            outputs=None, # This function has no UI outputs
+            outputs=start, # This function has no UI outputs
         )
 
 
     do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
-    demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner])
+    demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner,save_filename_dropdown])
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
