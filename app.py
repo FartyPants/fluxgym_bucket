@@ -17,6 +17,7 @@ import json
 import yaml
 from slugify import slugify
 from transformers import AutoProcessor, AutoModelForCausalLM
+from transformers import Florence2Processor, Florence2ForConditionalGeneration
 from gradio_logsview import LogsView, LogsViewRunner
 from huggingface_hub import hf_hub_download, HfApi
 from library import flux_train_utils, huggingface_util
@@ -329,7 +330,6 @@ def create_dataset(destination_folder, size, downscale_only, *inputs):
     # Return the final folder path to update the State variable
     return destination_folder
   
-
 def run_captioning(images, concept_sentence, *captions):
     print(f"run_captioning")
     print(f"concept sentence {concept_sentence}")
@@ -338,10 +338,19 @@ def run_captioning(images, concept_sentence, *captions):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device={device}")
     torch_dtype = torch.float16
-    model = AutoModelForCausalLM.from_pretrained(
-        "multimodalart/Florence-2-large-no-flash-attn", torch_dtype=torch_dtype, trust_remote_code=True
-    ).to(device)
-    processor = AutoProcessor.from_pretrained("multimodalart/Florence-2-large-no-flash-attn", trust_remote_code=True)
+
+    MODEL_ID = "ducviet00/Florence-2-large-hf"
+    #MODEL_ID = "multimodalart/Florence-2-large-no-flash-attn"
+    #MODEL_ID = "microsoft/Florence-2-large"
+
+    processor = Florence2Processor.from_pretrained( MODEL_ID, torch_dtype=torch_dtype, trust_remote_code=True)
+
+    model = Florence2ForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
+
+    #model = AutoModelForCausalLM.from_pretrained(
+    #    "multimodalart/Florence-2-large-no-flash-attn", torch_dtype=torch_dtype, trust_remote_code=True
+    #).to(device)
+    #processor = AutoProcessor.from_pretrained("multimodalart/Florence-2-large-no-flash-attn", trust_remote_code=True)
 
     captions = list(captions)
     for i, image_path in enumerate(images):
@@ -1932,11 +1941,21 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                         """# Step 3. Train
         <p style="margin-top:0">Press start to start training.</p>
         """, elem_classes="group_padding")
-                    refresh = gr.Button("Refresh", elem_id="refresh", visible=False)
+                    refresh = gr.Button("Create Configs", elem_id="refresh", visible=True)
                     start = gr.Button("Start training", visible=False, elem_id="start_training")
                     output_components.append(start)
                     train_script = gr.Textbox(label="Train script", max_lines=100, interactive=True)
                     train_config = gr.Textbox(label="Train config", max_lines=100, interactive=True)
+
+            with gr.Accordion("Basic options", elem_id='basic_options', open=True):
+                with gr.Row():
+                    with gr.Column(min_width=300):
+                        learning_rate = gr.Textbox(label="--learning_rate", info="Learning Rate", value="8e-4", interactive=True)
+                    with gr.Column(min_width=300):
+                        network_dim = gr.Number(label="--network_dim", info="LoRA Rank", value=4, minimum=4, maximum=128, step=4, interactive=True)
+                    with gr.Column(min_width=300):
+                        save_every_n_epochs = gr.Number(label="--save_every_n_epochs", info="Save every N epochs", value=2, interactive=True)
+ 
             with gr.Accordion("Advanced options", elem_id='advanced_options', open=False):
                 with gr.Row():
                     with gr.Column(min_width=300):
@@ -1944,15 +1963,10 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     with gr.Column(min_width=300):
                         workers = gr.Number(label="--max_data_loader_n_workers", info="Number of Workers", value=2, interactive=True)
                     with gr.Column(min_width=300):
-                        learning_rate = gr.Textbox(label="--learning_rate", info="Learning Rate", value="8e-4", interactive=True)
-                    with gr.Column(min_width=300):
-                        save_every_n_epochs = gr.Number(label="--save_every_n_epochs", info="Save every N epochs", value=2, interactive=True)
-                    with gr.Column(min_width=300):
                         guidance_scale = gr.Number(label="--guidance_scale", info="Guidance Scale", value=1.0, interactive=True)
                     with gr.Column(min_width=300):
                         timestep_sampling = gr.Textbox(label="--timestep_sampling", info="Timestep Sampling", value="shift", interactive=True)
-                    with gr.Column(min_width=300):
-                        network_dim = gr.Number(label="--network_dim", info="LoRA Rank", value=4, minimum=4, maximum=128, step=4, interactive=True)
+ 
                     advanced_components, advanced_component_ids = init_advanced()
                     try:
                         train_batch_size_index = advanced_component_ids.index('--train_batch_size')
@@ -2031,7 +2045,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     # Outputs list includes basic components and unpacked advanced components
     load_button.click(
         fn=load_parameters_logic,
-        inputs=[save_filename], # Input is just the filename value
+        inputs=[save_filename_dropdown], # Input is just the filename value
         outputs=[
             base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
             concept_sentence, learning_rate, network_dim, max_train_epochs, batch_size, 
@@ -2189,7 +2203,8 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         *advanced_components
     ]
 
-    start.click(
+    start.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder]
+        ).then(
             fn=save_last_run_config,
             inputs=all_param_components,
             outputs=start
