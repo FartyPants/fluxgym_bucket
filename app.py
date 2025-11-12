@@ -30,7 +30,7 @@ import math
 
 training_subprocess = None
 
-MAX_IMAGES = 150
+MAX_IMAGES = 300
 
 with open('models.yaml', 'r') as file:
     models = yaml.safe_load(file)
@@ -462,6 +462,7 @@ def gen_sh(
     vram,
     sample_prompts,
     sample_every_n_steps,
+     custom_params,
     *advanced_components
 ):
 
@@ -582,6 +583,15 @@ def gen_sh(
     if len(advanced_flags) > 0:
         advanced_flags_str = f" {line_break}\n  ".join(advanced_flags)
         sh = sh + "\n  " + advanced_flags_str
+
+    if custom_params and custom_params.strip():
+        # Sanitize input: split by lines, strip whitespace from each, and filter out any empty lines
+        lines = [line.strip() for line in custom_params.strip().split('\n') if line.strip()]
+        if lines:
+            # Join the sanitized lines with the correct line break and indentation
+            custom_params_formatted = f" {line_break}\n  ".join(lines)
+            # Append to the main script string
+            sh += f" {line_break}\n  {custom_params_formatted}"
 
     return sh
 
@@ -907,6 +917,7 @@ def update(
     num_repeats,
     sample_prompts,
     sample_every_n_steps,
+    custom_params,
     *advanced_components,
 ):
     output_name = slugify(lora_name)
@@ -927,6 +938,7 @@ def update(
         vram,
         sample_prompts,
         sample_every_n_steps,
+        custom_params,
         *advanced_components,
     )
     toml = gen_toml(
@@ -1136,8 +1148,7 @@ function() {
     }
     const debouncedClick = debounce(handleClick, 1000);
     document.addEventListener("input", debouncedClick);
-    })
-}
+ }
 """
 
 old_js = """
@@ -1249,7 +1260,7 @@ def save_last_run_config(
     base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
     workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value,
     batch_size_value, save_every_n_epochs_value, timestep_sampling_value, guidance_scale_value, vram_value, num_repeats_value,
-    sample_prompts_value, sample_every_n_steps_value,
+    sample_prompts_value, sample_every_n_steps_value, custom_params_value,
     *advanced_component_values
 ):
     """A wrapper to call save_parameters_logic with a fixed filename."""
@@ -1261,7 +1272,7 @@ def save_last_run_config(
         base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
         workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value,
         batch_size_value, save_every_n_epochs_value, timestep_sampling_value, guidance_scale_value, vram_value, num_repeats_value,
-        sample_prompts_value, sample_every_n_steps_value,
+        sample_prompts_value, sample_every_n_steps_value, custom_params_value,
         "last_run.json", # <-- The filename is now in the correct position
         *advanced_component_values
     )
@@ -1272,7 +1283,7 @@ def save_parameters_logic(
     base_model_value, lora_name_value, resolutionX_value, resolutionY_value, resize_value, downscale_only_value, seed_value,
     workers_value, concept_sentence_value, learning_rate_value, network_dim_value, max_train_epochs_value, batch_size_value,
     save_every_n_epochs_value, timestep_sampling_value, guidance_scale_value, vram_value, num_repeats_value,
-    sample_prompts_value, sample_every_n_steps_value,
+    sample_prompts_value, sample_every_n_steps_value, custom_params_value, 
     filename_value, # Filename component value
     *advanced_component_values # Tuple of advanced parameter values
 ):
@@ -1302,6 +1313,7 @@ def save_parameters_logic(
         "num_repeats": num_repeats_value,
         "sample_prompts": sample_prompts_value,
         "sample_every_n_steps": sample_every_n_steps_value,
+        "custom_params": custom_params_value,
     }
 
     # Collect advanced parameters using the global IDs and input values
@@ -1374,6 +1386,7 @@ def load_parameters_logic(save_filename_value): # Only need the value from the f
         num_repeats_val = params.get("num_repeats", None)
         sample_prompts_val = params.get("sample_prompts", None)
         sample_every_n_steps_val = params.get("sample_every_n_steps", None)
+        custom_params_val = params.get("custom_params", "")
 
         # Get advanced parameter values from the loaded dictionary
         advanced_params = params.get("advanced_parameters", {})
@@ -1391,26 +1404,26 @@ def load_parameters_logic(save_filename_value): # Only need the value from the f
             base_model_val, lora_name_val, resolutionX_val, resolutionY_val, resize_val, downscale_only_val,
             seed_val, workers_val, concept_sentence_val, learning_rate_val, network_dim_val,
             max_train_epochs_val, batch_size_val, save_every_n_epochs_val, timestep_sampling_val, guidance_scale_val,
-            vram_val, num_repeats_val, sample_prompts_val, sample_every_n_steps_val,
+            vram_val, num_repeats_val, sample_prompts_val, sample_every_n_steps_val, custom_params_val, 
             *output_advanced_values # Unpack the collected advanced values into the return tuple
         )
 
     except FileNotFoundError:
         gr.Error(f"Config file not found: {save_path}")
         # Return None or default values for all outputs
-        num_basic_outputs = 18
+        num_basic_outputs = 19
         num_advanced_outputs = len(advanced_component_ids)
         return (None,) * num_basic_outputs + (None,) * num_advanced_outputs
     except json.JSONDecodeError:
          gr.Error(f"Error decoding JSON file: {save_path}. File might be corrupted.")
-         num_basic_outputs = 18
+         num_basic_outputs = 19
          num_advanced_outputs = len(advanced_component_ids)
          return (None,) * num_basic_outputs + (None,) * num_advanced_outputs
     except Exception as e:
         gr.Error(f"Error loading parameters from {save_path}: {e}")
         print(f"Error loading parameters: {e}")
         # Return None or default values for all outputs
-        num_basic_outputs = 18
+        num_basic_outputs = 19
         num_advanced_outputs = len(advanced_component_ids)
         return (None,) * num_basic_outputs + (None,) * num_advanced_outputs
 
@@ -1941,11 +1954,17 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                         """# Step 3. Train
         <p style="margin-top:0">Press start to start training.</p>
         """, elem_classes="group_padding")
-                    refresh = gr.Button("Create Configs", elem_id="refresh", visible=True)
-                    start = gr.Button("Start training", visible=False, elem_id="start_training")
+                    refresh = gr.Button("Create Script/Config", elem_id="refresh", visible=True)
+                    start = gr.Button("Start training", visible=True, elem_id="start_training")
                     output_components.append(start)
                     train_script = gr.Textbox(label="Train script", max_lines=100, interactive=True)
                     train_config = gr.Textbox(label="Train config", max_lines=100, interactive=True)
+                    custom_params = gr.Textbox(
+                        label="Custom Train Script Parameters",
+                        info="Add any extra command-line arguments here, one per line. E.g., --my_parameter 2",
+                        lines=3,
+                        interactive=True
+                    )
 
             with gr.Accordion("Basic options", elem_id='basic_options', open=True):
                 with gr.Row():
@@ -2036,6 +2055,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         num_repeats,
         sample_prompts,
         sample_every_n_steps,
+        custom_params,
         *advanced_components
     ]
 
@@ -2050,7 +2070,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
             base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
             concept_sentence, learning_rate, network_dim, max_train_epochs, batch_size, 
             save_every_n_epochs, timestep_sampling, guidance_scale, vram,
-            num_repeats, sample_prompts, sample_every_n_steps,
+            num_repeats, sample_prompts, sample_every_n_steps, custom_params,
             *advanced_components # Unpack the list of advanced components
         ]
     ).then( # Chain the update function after loading
@@ -2104,7 +2124,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
             base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
             concept_sentence, learning_rate, network_dim, max_train_epochs, batch_size, 
             save_every_n_epochs, timestep_sampling, guidance_scale, vram,
-            num_repeats, sample_prompts, sample_every_n_steps,
+            num_repeats, sample_prompts, sample_every_n_steps, custom_params,
             save_filename, # Pass the filename component value
             *advanced_components # Unpack the list of advanced components
         ],
@@ -2199,7 +2219,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         base_model, lora_name, resolutionX, resolutionY, resize, downscale_only, seed, workers,
         concept_sentence, learning_rate, network_dim, max_train_epochs, batch_size,
         save_every_n_epochs, timestep_sampling, guidance_scale, vram,
-        num_repeats, sample_prompts, sample_every_n_steps,
+        num_repeats, sample_prompts, sample_every_n_steps, custom_params,
         *advanced_components
     ]
 
